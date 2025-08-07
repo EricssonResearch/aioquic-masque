@@ -1,8 +1,10 @@
 import argparse
 import asyncio
+import copy
 import logging
 import os
 import pickle
+import socket
 import ssl
 import time
 from collections import deque
@@ -10,14 +12,19 @@ from typing import BinaryIO, Callable, Deque, Dict, List, Optional, Union, cast
 from urllib.parse import urlparse
 
 import aioquic
+from aioquic.asyncio.tunnel_transport import MasqueTransport
+from aioquic.masque.events import Connected, MasqueEvent, ProxiedDatagramReceived
+from aioquic.masque.tunnel import MasqueTunnel, UdpTunnel
+from aioquic.quic.connection import QuicConnection, QuicTokenHandler
 import wsproto
 import wsproto.events
 from aioquic.asyncio.client import connect
-from aioquic.asyncio.protocol import QuicConnectionProtocol
+from aioquic.asyncio.protocol import QuicConnectionProtocol, QuicStreamHandler
 from aioquic.h0.connection import H0_ALPN, H0Connection
 from aioquic.h3.connection import H3_ALPN, ErrorCode, H3Connection
 from aioquic.h3.events import (
     DataReceived,
+    DatagramReceived,
     H3Event,
     HeadersReceived,
     PushPromiseReceived,
@@ -26,7 +33,7 @@ from aioquic.quic.configuration import QuicConfiguration
 from aioquic.quic.events import QuicEvent
 from aioquic.quic.logger import QuicFileLogger
 from aioquic.quic.packet import QuicProtocolVersion
-from aioquic.tls import CipherSuite, SessionTicket
+from aioquic.tls import CipherSuite, SessionTicket, SessionTicketHandler
 
 try:
     import uvloop
@@ -120,6 +127,83 @@ class WebSocket:
         if isinstance(event, wsproto.events.TextMessage):
             self.queue.put_nowait(event.data)
 
+
+class MasqueClient(QuicConnectionProtocol):
+    def __init__(self, *args, **kwargs) -> None:
+        super().__init__(*args, **kwargs)
+
+        self._connect_waiter: Dict[int, asyncio.Future[MasqueEvent]] = {}
+        self._http = H3Connection(self._quic, enable_masque=True)
+        self._tunnels: Dict[int, MasqueTunnel] = {}
+        self._transports: Dict[int, MasqueTransport] = {}
+    
+    async def connect_udp(self, 
+                          uri: str,
+                          addr: str,
+                          configuration: QuicConfiguration,
+                          create_protocol: Callable = QuicConnectionProtocol,
+                          session_ticket_handler: Optional[SessionTicketHandler] = None,
+                          token_handler: Optional[QuicTokenHandler] = None,
+                          ) -> QuicConnectionProtocol:
+        if self._http is None:
+            raise Exception("No HTTP connection")
+        
+        stream_id = self._quic.get_next_available_stream_id()
+        tunnel = UdpTunnel(self._http, stream_id)
+        self._tunnels[stream_id] = tunnel
+        tunnel.connect(uri)
+        waiter = self._loop.create_future()
+        self._connect_waiter[stream_id] = waiter
+        await asyncio.shield(waiter)
+
+        connection = QuicConnection(
+            configuration=configuration, 
+            session_ticket_handler=session_ticket_handler,
+            token_handler=token_handler,
+        )
+
+        def send_datagram(data: bytes) -> None:
+            tunnel.send_datagram(data)
+            self.transmit()
+
+        proto: QuicConnectionProtocol = create_protocol(connection)
+        transport = MasqueTransport(addr=addr, send=send_datagram)
+        self._transports[stream_id] = transport
+        proto.connection_made(transport)
+        transport.set_protocol(proto)
+        [host, port] = addr.split(':')
+        infos = await self._loop.getaddrinfo(host, port, type=socket.SOCK_DGRAM)
+        target = infos[0][4]
+        if len(target) == 2:
+            target = ("::ffff:" + target[0], target[1], 0, 0)
+        proto.connect(target)
+        await proto.wait_connected()
+        
+        return proto
+
+    def http_event_received(self, event: H3Event) -> None:
+        if isinstance(event, (HeadersReceived, DataReceived, DatagramReceived)) and event.stream_id in self._tunnels:
+            masque_events = self._tunnels[event.stream_id].handle_http_event(event)
+            for masque_event in masque_events:
+                self.masque_event_received(masque_event)
+
+    def masque_event_received(self, event: MasqueEvent) -> None:
+        if isinstance(event, Connected):
+            if event.stream_id in self._connect_waiter:
+                self._connect_waiter[event.stream_id].set_result(event)
+                del self._connect_waiter[event.stream_id]
+            else:
+                raise Exception("Unknown stream id")
+        elif isinstance(event, ProxiedDatagramReceived):
+            if event.stream_id in self._transports:
+                self._transports[event.stream_id].data_received(event.datagram)
+    
+    def quic_event_received(self, event: QuicEvent) -> None:
+        #  pass event to the HTTP layer
+        if self._http is not None:
+            for http_event in self._http.handle_event(event):
+                self.http_event_received(http_event)
+                
 
 class HttpClient(QuicConnectionProtocol):
     def __init__(self, *args, **kwargs) -> None:
@@ -385,47 +469,108 @@ async def main(
         _p = urlparse(_p.geturl())
         urls[i] = _p.geturl()
 
-    async with connect(
-        host,
-        port,
-        configuration=configuration,
-        create_protocol=HttpClient,
-        session_ticket_handler=save_session_ticket,
-        local_port=local_port,
-        wait_connected=not zero_rtt,
-    ) as client:
-        client = cast(HttpClient, client)
+    if args.connect_udp:
+        # Use MASQUE proxy
+        proxy_parsed = urlparse(args.connect_udp)
+        proxy_host = proxy_parsed.hostname
+        proxy_port = proxy_parsed.port or 443
+        
+        logger.debug("Connecting to %s:%s", proxy_host, proxy_port)
 
-        if parsed.scheme == "wss":
-            ws = await client.websocket(urls[0], subprotocols=["chat", "superchat"])
+        async with connect(
+            proxy_host,
+            proxy_port,
+            configuration=tunnel_configuration,
+            create_protocol=MasqueClient,
+            session_ticket_handler=save_session_ticket,
+            local_port=local_port,
+            wait_connected=not zero_rtt,
+        ) as masque_client:
+            masque_client = cast(MasqueClient, masque_client)
+            
+            # Connect to target via MASQUE
+            client = await masque_client.connect_udp(
+                args.connect_udp,
+                f"{host}:{port}",
+                configuration=configuration, 
+                create_protocol=HttpClient,
+                session_ticket_handler=save_session_ticket,
+            )
+            client = cast(HttpClient, client)
 
-            # send some messages and receive reply
-            for i in range(2):
-                message = "Hello {}, WebSocket!".format(i)
-                print("> " + message)
-                await ws.send(message)
+            if parsed.scheme == "wss":
+                ws = await client.websocket(urls[0], subprotocols=["chat", "superchat"])
 
-                message = await ws.recv()
-                print("< " + message)
+                # send some messages and receive reply
+                for i in range(2):
+                    message = "Hello {}, WebSocket!".format(i)
+                    print("> " + message)
+                    await ws.send(message)
 
-            await ws.close()
-        else:
-            # perform request
-            coros = [
-                perform_http_request(
-                    client=client,
-                    url=url,
-                    data=data,
-                    include=include,
-                    output_dir=output_dir,
-                )
-                for url in urls
-            ]
-            await asyncio.gather(*coros)
+                    message = await ws.recv()
+                    print("< " + message)
 
-            # process http pushes
-            process_http_pushes(client=client, include=include, output_dir=output_dir)
-        client.close(error_code=ErrorCode.H3_NO_ERROR)
+                await ws.close()
+            else:
+                # perform request
+                coros = [
+                    perform_http_request(
+                        client=client,
+                        url=url,
+                        data=data,
+                        include=include,
+                        output_dir=output_dir,
+                    )
+                    for url in urls
+                ]
+                await asyncio.gather(*coros)
+
+                # process http pushes
+                process_http_pushes(client=client, include=include, output_dir=output_dir)
+            client.close(error_code=ErrorCode.H3_NO_ERROR)
+    else:
+        # Direct connection
+        async with connect(
+            host,
+            port,
+            configuration=configuration,
+            create_protocol=HttpClient,
+            session_ticket_handler=save_session_ticket,
+            local_port=local_port,
+            wait_connected=not zero_rtt,
+        ) as client:
+            client = cast(HttpClient, client)
+
+            if parsed.scheme == "wss":
+                ws = await client.websocket(urls[0], subprotocols=["chat", "superchat"])
+
+                # send some messages and receive reply
+                for i in range(2):
+                    message = "Hello {}, WebSocket!".format(i)
+                    print("> " + message)
+                    await ws.send(message)
+
+                    message = await ws.recv()
+                    print("< " + message)
+
+                await ws.close()
+            else:
+                # perform request
+                coros = [
+                    perform_http_request(
+                        client=client,
+                        url=url,
+                        data=data,
+                        include=include,
+                        output_dir=output_dir,
+                    )
+                    for url in urls
+                ]
+                await asyncio.gather(*coros)
+
+                # process http pushes
+                process_http_pushes(client=client, include=include, output_dir=output_dir)
+            client.close(error_code=ErrorCode.H3_NO_ERROR)
 
 
 if __name__ == "__main__":
@@ -456,6 +601,12 @@ if __name__ == "__main__":
         type=str,
         default="reno",
         help="use the specified congestion control algorithm",
+    )
+    parser.add_argument(
+        "--connect-udp",
+        type=str,
+        default="",
+        help="connect via an HTTP3 proxy at the specified URI (must be HTTPS)",
     )
     parser.add_argument(
         "-d", "--data", type=str, help="send the specified data in a POST request"
@@ -588,6 +739,12 @@ if __name__ == "__main__":
     # load SSL certificate and key
     if args.certificate is not None:
         configuration.load_cert_chain(args.certificate, args.private_key)
+
+    # create tunnel configuration by copying and modifying
+    tunnel_configuration = copy.deepcopy(configuration)
+    tunnel_configuration.alpn_protocols = H3_ALPN
+    tunnel_configuration.max_datagram_size = 1400
+    tunnel_configuration.max_datagram_frame_size = 1400
 
     if uvloop is not None:
         uvloop.install()

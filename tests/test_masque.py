@@ -1,5 +1,6 @@
 from unittest import TestCase
-from aioquic.masque.capsule import CapsuleBuffer, CapsuleType, DatagramCapsule, encode_capsule
+from aioquic.masque.capsule import CapsuleBuffer, CapsuleType, DatagramCapsule
+from aioquic.masque.capsule import _encode_capsule as encode_capsule
 from aioquic.buffer import Buffer, UINT_VAR_MAX_SIZE
 
 

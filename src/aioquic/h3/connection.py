@@ -365,10 +365,11 @@ class H3Connection:
     :param quic: A :class:`~aioquic.quic.connection.QuicConnection` instance.
     """
 
-    def __init__(self, quic: QuicConnection, enable_webtransport: bool = False) -> None:
+    def __init__(self, quic: QuicConnection, enable_masque: bool = False, enable_webtransport: bool = False) -> None:
         # settings
         self._max_table_capacity = 4096
         self._blocked_streams = 16
+        self._enable_masque = enable_masque
         self._enable_webtransport = enable_webtransport
 
         self._is_client = quic.configuration.is_client
@@ -661,6 +662,8 @@ class H3Connection:
             Setting.ENABLE_CONNECT_PROTOCOL: 1,
             Setting.DUMMY: 1,
         }
+        if self._enable_masque:
+            settings[Setting.H3_DATAGRAM] = 1
         if self._enable_webtransport:
             settings[Setting.H3_DATAGRAM] = 1
             settings[Setting.ENABLE_WEBTRANSPORT] = 1
