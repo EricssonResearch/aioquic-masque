@@ -1,7 +1,12 @@
 from unittest import TestCase
+from unittest.mock import Mock
 from aioquic.masque.capsule import CapsuleBuffer, CapsuleType, DatagramCapsule
 from aioquic.masque.capsule import _encode_capsule as encode_capsule
-from aioquic.buffer import Buffer, UINT_VAR_MAX_SIZE
+from aioquic.masque.tunnel import UdpTunnel, ConnectState
+from aioquic.masque.events import Connected, ConnectFailed
+from aioquic.masque.exceptions import MasqueError
+from aioquic.h3.events import HeadersReceived
+from aioquic.buffer import Buffer, UINT_VAR_MAX_SIZE, encode_uint_var
 
 
 
@@ -94,3 +99,108 @@ class CapsuleTest(TestCase):
         self.assertEqual(len(capsules), 1)
         self.assertIsInstance(capsules[0], DatagramCapsule)
         self.assertEqual(capsules[0].data, second + third) # type: ignore
+
+
+class TunnelTest(TestCase):
+    
+    def setUp(self):
+        self.http_mock = Mock()
+        self.stream_id = 4
+        self.tunnel = UdpTunnel(self.http_mock, self.stream_id)
+    
+    def test_connect_success(self):
+        uri = "https://proxy.example.com/.well-known/masque/udp/target.com/443/"
+        self.tunnel.connect(uri)
+        
+        self.assertEqual(self.tunnel._connect_state, ConnectState.CONNECT_SENT)
+        self.http_mock.send_headers.assert_called_once()
+    
+    def test_connect_invalid_uri(self):
+        with self.assertRaises(MasqueError):
+            self.tunnel.connect("http://proxy.example.com/path")
+    
+    def test_handle_headers_success(self):
+        self.tunnel._connect_state = ConnectState.CONNECT_SENT
+        event = HeadersReceived(
+            stream_id=self.stream_id,
+            headers=[(b':status', b'200'), (b'capsule-protocol', b'?1')],
+            stream_ended=False,
+            push_id=None
+        )
+        
+        events = self.tunnel.handle_http_event(event)
+        
+        self.assertEqual(len(events), 1)
+        self.assertIsInstance(events[0], Connected)
+        self.assertEqual(events[0].stream_id, self.stream_id)  # type: ignore
+    
+    def test_handle_headers_failed_status(self):
+        self.tunnel._connect_state = ConnectState.CONNECT_SENT
+        event = HeadersReceived(
+            stream_id=self.stream_id,
+            headers=[(b':status', b'404'), (b'capsule-protocol', b'?1')],
+            stream_ended=False,
+            push_id=None
+        )
+        
+        events = self.tunnel.handle_http_event(event)
+        
+        self.assertEqual(len(events), 1)
+        self.assertIsInstance(events[0], ConnectFailed)
+    
+    def test_handle_headers_capsule_zero(self):
+        self.tunnel._connect_state = ConnectState.CONNECT_SENT
+        event = HeadersReceived(
+            stream_id=self.stream_id,
+            headers=[(b':status', b'200'), (b'capsule-protocol', b'?0')],
+            stream_ended=False,
+            push_id=None
+        )
+        
+        events = self.tunnel.handle_http_event(event)
+        
+        self.assertEqual(len(events), 1)
+        self.assertIsInstance(events[0], ConnectFailed)
+    
+
+    def test_handle_headers_capsule_missing(self):
+        self.tunnel._connect_state = ConnectState.CONNECT_SENT
+        event = HeadersReceived(
+            stream_id=self.stream_id,
+            headers=[(b':status', b'200')],
+            stream_ended=False,
+            push_id=None
+        )
+        
+        events = self.tunnel.handle_http_event(event)
+        
+        self.assertEqual(len(events), 1)
+        self.assertIsInstance(events[0], ConnectFailed)
+
+    def test_send_datagram_via_stream(self):
+        payload = b"test data"
+        self.tunnel.send_datagram(payload, stream=True)
+        
+        self.http_mock.send_data.assert_called_once()
+    
+    def test_send_datagram_via_datagram(self):
+        payload = b"test data"
+        self.tunnel.send_datagram(payload, stream=False)
+        
+        self.http_mock.send_datagram.assert_called_once()
+    
+    def test_receive_datagram_valid(self):
+        payload = b"test data"
+        context_id = encode_uint_var(0)
+        datagram_data = context_id + payload
+        
+        result = self.tunnel._receive_datagram(datagram_data)
+        self.assertEqual(result, payload)
+    
+    def test_receive_datagram_invalid_context(self):
+        payload = b"test data"
+        context_id = encode_uint_var(1)
+        datagram_data = context_id + payload
+        
+        result = self.tunnel._receive_datagram(datagram_data)
+        self.assertEqual(result, b'')

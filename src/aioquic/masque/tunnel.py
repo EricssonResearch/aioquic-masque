@@ -67,7 +67,7 @@ class UdpTunnel(MasqueTunnel):
 
             if self._connect_state != ConnectState.CONNECT_SENT:
                 raise MasqueError("Should not receive headers in this state.")
-
+            status, capsule = False, False
             for header, value in event.headers:
                 if header == b':status' and value.isdigit(): 
                     if int(value) in range(200, 300):
