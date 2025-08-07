@@ -37,27 +37,6 @@ class CapsuleBuffer():
         self._capsule_buffer: bytes = b''
         self._start: int = 0
 
-
-    # def read_capsule_data(self, data: bytes) -> List[Capsule]:
-    #     self._capsule_buffer += data
-    #     buf = Buffer(data=self._capsule_buffer)
-    #     capsules: List[Capsule] = []
-    #     consumed = 0       
-    #     while not buf.eof():
-    #         try:
-    #             ctype = buf.pull_uint_var()
-    #             clen = buf.pull_uint_var()
-    #             cdata = buf.pull_bytes(clen)
-    #         except BufferReadError:
-    #             break
-    #         if ctype == CapsuleType.DATAGRAM:
-    #             capsules.append(DatagramCapsule(data=cdata))
-    #         else:
-    #             capsules.append(Capsule())
-    #         consumed = buf.tell()
-    #     self._capsule_buffer = self._capsule_buffer[consumed:]
-    #     return capsules
-
     def read_capsule_data(self, data: bytes) -> List[Capsule]:
         try:
             self._buf.push_bytes(data)
