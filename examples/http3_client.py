@@ -13,7 +13,7 @@ from urllib.parse import urlparse
 
 import aioquic
 from aioquic.asyncio.tunnel_transport import MasqueTransport
-from aioquic.masque.events import Connected, MasqueEvent, ProxiedDatagramReceived
+from aioquic.masque.events import ConnectFailed, Connected, MasqueEvent, ProxiedDatagramReceived
 from aioquic.masque.tunnel import MasqueTunnel, UdpTunnel
 from aioquic.quic.connection import QuicConnection, QuicTokenHandler
 import wsproto
@@ -144,7 +144,7 @@ class MasqueClient(QuicConnectionProtocol):
                           create_protocol: Callable = QuicConnectionProtocol,
                           session_ticket_handler: Optional[SessionTicketHandler] = None,
                           token_handler: Optional[QuicTokenHandler] = None,
-                          ) -> QuicConnectionProtocol:
+                          ) -> Optional[QuicConnectionProtocol]:
         if self._http is None:
             raise Exception("No HTTP connection")
         
@@ -154,7 +154,11 @@ class MasqueClient(QuicConnectionProtocol):
         tunnel.connect(uri)
         waiter = self._loop.create_future()
         self._connect_waiter[stream_id] = waiter
-        await asyncio.shield(waiter)
+        try:
+            await asyncio.shield(waiter)
+        except Exception as e:
+            logger.error(f"{e}")
+            return None
 
         connection = QuicConnection(
             configuration=configuration, 
@@ -191,6 +195,12 @@ class MasqueClient(QuicConnectionProtocol):
         if isinstance(event, Connected):
             if event.stream_id in self._connect_waiter:
                 self._connect_waiter[event.stream_id].set_result(event)
+                del self._connect_waiter[event.stream_id]
+            else:
+                raise Exception("Unknown stream id")
+        elif isinstance(event, ConnectFailed):
+            if event.stream_id in self._connect_waiter:
+                self._connect_waiter[event.stream_id].set_exception(Exception(event.reason))
                 del self._connect_waiter[event.stream_id]
             else:
                 raise Exception("Unknown stream id")
@@ -475,7 +485,7 @@ async def main(
         proxy_host = proxy_parsed.hostname
         proxy_port = proxy_parsed.port or 443
         
-        logger.debug("Connecting to %s:%s", proxy_host, proxy_port)
+        print(f"Connecting to {proxy_host}:{proxy_port}")
 
         async with connect(
             proxy_host,
@@ -496,6 +506,10 @@ async def main(
                 create_protocol=HttpClient,
                 session_ticket_handler=save_session_ticket,
             )
+            if not client:
+                logger.info("Connect UDP failed")
+                return
+            logger.info(f"Connected to {host}:{port} via proxy {proxy_host}:{proxy_port}")
             client = cast(HttpClient, client)
 
             if parsed.scheme == "wss":

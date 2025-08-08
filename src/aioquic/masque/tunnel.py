@@ -28,6 +28,9 @@ class MasqueTunnel:
         self._http: H3Connection = http3_connection
         self.stream_id: int = stream_id
     
+    def connect(self, uri: str) -> None:
+        raise NotImplementedError("This method must be implemented by subclasses.")
+
     def handle_http_event(self, event: H3Event) -> List[MasqueEvent]:
         """
         Handling of HTTP events
@@ -73,7 +76,7 @@ class UdpTunnel(MasqueTunnel):
                     if int(value) in range(200, 300):
                         status = True
                     else:            
-                      return [ConnectFailed(self.stream_id, reason=f"Connect request failed with status {value}")]
+                      return [ConnectFailed(self.stream_id, reason=f"Connect request failed with status {value.decode()}")]
                 elif header == b'capsule-protocol' and value == b'?1':
                     capsule = True
             if not status:
@@ -87,7 +90,6 @@ class UdpTunnel(MasqueTunnel):
             masque_events.append(Connected(self.stream_id))
         
         elif isinstance(event, DataReceived):
-
             if self._connect_state != ConnectState.CONNECTED:
                 raise MasqueError("Unknown data received")
             
@@ -95,7 +97,7 @@ class UdpTunnel(MasqueTunnel):
                 if isinstance(capsule, DatagramCapsule):
                     datagram = self._receive_datagram(capsule.data)
                     if datagram:
-                        masque_events.append(ProxiedDatagramReceived(self.stream_id, event.data))
+                        masque_events.append(ProxiedDatagramReceived(self.stream_id, datagram))
         
         elif isinstance(event, DatagramReceived):
             assert event.stream_id == self.stream_id

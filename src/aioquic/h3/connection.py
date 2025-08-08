@@ -476,7 +476,6 @@ class H3Connection:
             raise InvalidStreamTypeError(
                 "Datagrams can only be sent for client-initiated bidirectional streams"
             )
-
         self._quic.send_datagram_frame(encode_uint_var(stream_id // 4) + data)
 
     def send_push_promise(self, stream_id: int, headers: Headers) -> int:

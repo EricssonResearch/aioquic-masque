@@ -2,6 +2,7 @@ import argparse
 import asyncio
 import importlib
 import logging
+import socket
 import time
 from collections import deque
 from email.utils import formatdate
@@ -11,6 +12,7 @@ import aioquic
 import wsproto
 import wsproto.events
 from aioquic.asyncio import QuicConnectionProtocol, serve
+from aioquic.buffer import encode_uint_var
 from aioquic.h0.connection import H0_ALPN, H0Connection
 from aioquic.h3.connection import H3_ALPN, H3Connection
 from aioquic.h3.events import (
@@ -21,6 +23,7 @@ from aioquic.h3.events import (
     WebTransportStreamDataReceived,
 )
 from aioquic.h3.exceptions import NoAvailablePushIDError
+from aioquic.masque.capsule import CapsuleBuffer, DatagramCapsule, encode_datagram_capsule
 from aioquic.quic.configuration import QuicConfiguration
 from aioquic.quic.events import DatagramFrameReceived, ProtocolNegotiated, QuicEvent
 from aioquic.quic.logger import QuicFileLogger
@@ -319,14 +322,125 @@ class WebTransportHandler:
         self.transmit()
 
 
-Handler = Union[HttpRequestHandler, WebSocketHandler, WebTransportHandler]
+class MasqueHandler:
+    def __init__(
+        self,
+        *,
+        connection: H3Connection,
+        stream_id: int,
+        target_host: str,
+        target_port: int,
+        transmit: Callable[[], None],
+    ) -> None:
+        self.connection = connection
+        self.stream_id = stream_id
+        self.target_host = target_host
+        self.target_port = target_port
+        self.transmit = transmit
+        self.transport: Optional[asyncio.DatagramTransport] = None
+        self.protocol: Optional[asyncio.DatagramProtocol] = None
+        self._capsule_buffer = CapsuleBuffer()
+        
+    async def start(self) -> None:
+        # Resolve target host
+        self.connection._quic._logger.debug(f"Masque handler resolving for: {self.target_host}")
+        loop = asyncio.get_event_loop()
+        try:
+            infos = await loop.getaddrinfo(
+                self.target_host, self.target_port, 
+                family=socket.AF_UNSPEC, type=socket.SOCK_DGRAM
+            )
+        except socket.gaierror:
+            # Send 404 for resolution failure
+            self.connection.send_headers(
+                stream_id=self.stream_id,
+                headers=[(b":status", b"404")],
+            )
+            self.transmit()
+            return
+        
+        # Choose first available address (prefer IPv4)
+        ipv4_addresses = [info[4][0] for info in infos if info[0] == socket.AF_INET]
+        ipv6_addresses = [info[4][0] for info in infos if info[0] == socket.AF_INET6]
+        target_addr = ipv4_addresses[0] if ipv4_addresses else ipv6_addresses[0]
+        
+        # Send 200 response with capsule-protocol header
+        self.connection.send_headers(
+            stream_id=self.stream_id,
+            headers=[
+                (b":status", b"200"),
+                (b"capsule-protocol", b"?1"),
+            ],
+        )
+        self.transmit()
+        
+        # Create UDP socket and protocol
+        self.transport, self.protocol = await loop.create_datagram_endpoint(
+            lambda: MasqueDatagramProtocol(self),
+            remote_addr=(target_addr, self.target_port)
+        )
+    
+    async def run_asgi(self, app) -> None:
+        # MASQUE handlers don't use ASGI, just keep the connection alive
+        pass
+
+    def send_to_target(self, data: bytes) -> None:
+        if self.transport:
+            self.transport.sendto(data)
+    
+    def send_to_client(self, data: bytes, via_stream: bool = False) -> None:
+        context_id = encode_uint_var(0)  # UDP_PAYLOAD
+        datagram = context_id + data
+        if via_stream:
+            self.connection.send_data(
+                self.stream_id, encode_datagram_capsule(datagram), end_stream=False
+            )
+        else:
+            self.connection.send_datagram(self.stream_id, datagram)
+        self.transmit()
+    
+    def http_event_received(self, event: H3Event) -> None:
+        if isinstance(event, DataReceived):
+            # Parse capsules from stream data
+            for capsule in self._capsule_buffer.read_capsule_data(event.data):
+                if isinstance(capsule, DatagramCapsule):
+                    self._process_datagram(capsule.data)
+        elif isinstance(event, DatagramReceived):
+            # Process datagram directly
+            self._process_datagram(event.data)
+    
+    def _process_datagram(self, data: bytes) -> None:
+        # Extract payload from MASQUE datagram
+        if len(data) > 0:
+            ctx_size = 1 << ((data[0] & 0xc0) >> 6)
+            if len(data) > ctx_size:
+                context_id = int.from_bytes(data[:ctx_size]) & 0x3f
+                if context_id == 0:  # UDP_PAYLOAD
+                    payload = data[ctx_size:]
+                    self.send_to_target(payload)
+    
+    def close(self) -> None:
+        if self.transport:
+            self.transport.close()
+
+
+class MasqueDatagramProtocol(asyncio.DatagramProtocol):
+    def __init__(self, handler: MasqueHandler) -> None:
+        self.handler = handler
+    
+    def datagram_received(self, data: bytes, addr) -> None:
+        self.handler.send_to_client(data)
+
+
+Handler = Union[HttpRequestHandler, WebSocketHandler, WebTransportHandler, MasqueHandler]
 
 
 class HttpServerProtocol(QuicConnectionProtocol):
-    def __init__(self, *args, **kwargs) -> None:
+    def __init__(self, *args, enable_masque: bool = False, **kwargs) -> None:
         super().__init__(*args, **kwargs)
         self._handlers: Dict[int, Handler] = {}
         self._http: Optional[HttpConnection] = None
+        self._enable_masque = enable_masque
 
     def http_event_received(self, event: H3Event) -> None:
         if isinstance(event, HeadersReceived) and event.stream_id not in self._handlers:
@@ -386,6 +500,36 @@ class HttpServerProtocol(QuicConnectionProtocol):
                     stream_id=event.stream_id,
                     transmit=self.transmit,
                 )
+            elif method == "CONNECT" and protocol == "connect-udp" and self._enable_masque:
+                assert isinstance(self._http, H3Connection), (
+                    "MASQUE is only supported over HTTP/3"
+                )
+                # Accept path: /.well-known/masque/udp/{host}/{port}/
+                path_parts = path.strip('/').split('/')
+                if len(path_parts) == 5 and path_parts[:3] == ['.well-known', 'masque', 'udp'] and path_parts[4].isdigit():
+                    target_host = path_parts[3]
+                    target_port = int(path_parts[4])
+                    handler = MasqueHandler(
+                        connection=self._http,
+                        stream_id=event.stream_id,
+                        target_host=target_host,
+                        target_port=target_port,
+                        transmit=self.transmit,
+                    )
+                    self._handlers[event.stream_id] = handler
+                    asyncio.ensure_future(handler.start())
+                    return
+                else:
+                    self._quic._logger.debug(f"Invalid path: {path}")
+                    # Invalid MASQUE path, send 400
+                    self._http.send_headers(
+                        stream_id=event.stream_id,
+                        headers=[(b":status", b"400")],
+                        end_stream=True,
+                    )
+                    self.transmit()
+                    return
+            
             elif method == "CONNECT" and protocol == "webtransport":
                 assert isinstance(self._http, H3Connection), (
                     "WebTransport is only supported over HTTP/3"
@@ -434,8 +578,9 @@ class HttpServerProtocol(QuicConnectionProtocol):
                     stream_id=event.stream_id,
                     transmit=self.transmit,
                 )
-            self._handlers[event.stream_id] = handler
-            asyncio.ensure_future(handler.run_asgi(application))
+            if not isinstance(handler, MasqueHandler):
+                self._handlers[event.stream_id] = handler
+                asyncio.ensure_future(handler.run_asgi(application))
         elif (
             isinstance(event, (DataReceived, HeadersReceived))
             and event.stream_id in self._handlers
@@ -443,8 +588,9 @@ class HttpServerProtocol(QuicConnectionProtocol):
             handler = self._handlers[event.stream_id]
             handler.http_event_received(event)
         elif isinstance(event, DatagramReceived):
-            handler = self._handlers[event.stream_id]
-            handler.http_event_received(event)
+            if event.stream_id in self._handlers:
+                handler = self._handlers[event.stream_id]
+                handler.http_event_received(event)
         elif isinstance(event, WebTransportStreamDataReceived):
             handler = self._handlers[event.session_id]
             handler.http_event_received(event)
@@ -452,7 +598,11 @@ class HttpServerProtocol(QuicConnectionProtocol):
     def quic_event_received(self, event: QuicEvent) -> None:
         if isinstance(event, ProtocolNegotiated):
             if event.alpn_protocol in H3_ALPN:
-                self._http = H3Connection(self._quic, enable_webtransport=True)
+                self._http = H3Connection(
+                    self._quic, 
+                    enable_webtransport=True, 
+                    enable_masque=self._enable_masque
+                )
             elif event.alpn_protocol in H0_ALPN:
                 self._http = H0Connection(self._quic)
         elif isinstance(event, DatagramFrameReceived):
@@ -486,12 +636,16 @@ async def main(
     configuration: QuicConfiguration,
     session_ticket_store: SessionTicketStore,
     retry: bool,
+    enable_masque: bool = False,
 ) -> None:
+    def create_protocol(*args, **kwargs):
+        return HttpServerProtocol(*args, enable_masque=enable_masque, **kwargs)
+    
     await serve(
         host,
         port,
         configuration=configuration,
-        create_protocol=HttpServerProtocol,
+        create_protocol=create_protocol,
         session_ticket_fetcher=session_ticket_store.pop,
         session_ticket_handler=session_ticket_store.add,
         retry=retry,
@@ -567,6 +721,9 @@ if __name__ == "__main__":
     parser.add_argument(
         "-v", "--verbose", action="store_true", help="increase logging verbosity"
     )
+    parser.add_argument(
+        "--enable-masque", action="store_true", help="enable MASQUE proxy support"
+    )
     args = parser.parse_args()
 
     logging.basicConfig(
@@ -615,6 +772,7 @@ if __name__ == "__main__":
                 configuration=configuration,
                 session_ticket_store=SessionTicketStore(),
                 retry=args.retry,
+                enable_masque=args.enable_masque,
             )
         )
     except KeyboardInterrupt:
