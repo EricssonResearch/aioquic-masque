@@ -3,9 +3,9 @@ from unittest.mock import Mock
 from aioquic.masque.capsule import CapsuleBuffer, CapsuleType, DatagramCapsule
 from aioquic.masque.capsule import _encode_capsule as encode_capsule
 from aioquic.masque.tunnel import UdpTunnel, ConnectState
-from aioquic.masque.events import Connected, ConnectFailed
+from aioquic.masque.events import Connected, ConnectFailed, ProxiedDatagramReceived
 from aioquic.masque.exceptions import MasqueError
-from aioquic.h3.events import HeadersReceived
+from aioquic.h3.events import DataReceived, DatagramReceived, HeadersReceived
 from aioquic.buffer import Buffer, UINT_VAR_MAX_SIZE, encode_uint_var
 
 
@@ -204,3 +204,35 @@ class TunnelTest(TestCase):
         
         result = self.tunnel._receive_datagram(datagram_data)
         self.assertEqual(result, b'')
+    
+    def test_handle_http_event_datagram(self):
+        payload = b"test data"
+        context_id = encode_uint_var(0)
+        datagram_data = context_id + payload
+        self.tunnel._connect_state = ConnectState.CONNECTED
+
+        event = DatagramReceived(
+            stream_id=self.stream_id,
+            data=datagram_data,
+        )
+        masque_events = self.tunnel.handle_http_event(event)
+        self.assertEqual(len(masque_events), 1)
+        self.assertIsInstance(masque_events[0], ProxiedDatagramReceived)
+        self.assertEqual(masque_events[0].datagram, payload)  # type: ignore
+
+    def test_handle_http_event_data(self):
+        payload = b"test data"
+        context_id = encode_uint_var(0)
+        datagram_data = context_id + payload
+        capsule = encode_capsule(CapsuleType.DATAGRAM, datagram_data)
+        self.tunnel._connect_state = ConnectState.CONNECTED
+
+        event = DataReceived(
+            stream_id=self.stream_id,
+            data=capsule,
+            stream_ended=False
+        )
+        masque_events = self.tunnel.handle_http_event(event)
+        self.assertEqual(len(masque_events), 1)
+        self.assertIsInstance(masque_events[0], ProxiedDatagramReceived)
+        self.assertEqual(masque_events[0].datagram, payload)  # type: ignore
